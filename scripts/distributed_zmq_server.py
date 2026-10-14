@@ -100,6 +100,11 @@ def main(argv=None) -> int:
     device = model_device(local_rank,
                           int(os.environ.get('LOCAL_WORLD_SIZE', '1')),
                           args.workers_per_gpu, torch.cuda.device_count())
+    # MMEngine uses LOCAL_RANK to index CUDA_VISIBLE_DEVICES. A torchrun
+    # replica rank can exceed the GPU count when replicas share a device.
+    # Keep the original rank for worker identity; expose its mapped GPU to
+    # dependencies before config imports or model construction initialize logs.
+    os.environ['LOCAL_RANK'] = str(torch.device(device).index)
     config_path = str(Path(args.config).expanduser().resolve(strict=True))
     cfg = Config.fromfile(config_path)
     if args.cfg_options:

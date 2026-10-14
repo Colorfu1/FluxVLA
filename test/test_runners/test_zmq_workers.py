@@ -1,5 +1,6 @@
 """Shared-GPU startup and fixed pairing on the stateless ZMQ service."""
 
+import os
 import runpy
 from pathlib import Path
 
@@ -10,8 +11,8 @@ from fluxvla.engines.runners.serving.distributed_server import \
 from fluxvla.engines.runners.serving.zmq_protocol import empty_payload
 
 ROOT = Path(__file__).resolve().parents[2]
-model_device = runpy.run_path(str(
-    ROOT / 'scripts/distributed_zmq_server.py'))['model_device']
+entrypoint = runpy.run_path(str(ROOT / 'scripts/distributed_zmq_server.py'))
+model_device = entrypoint['model_device']
 
 
 def make_server(monkeypatch, count=4, **kwargs):
@@ -39,6 +40,78 @@ def test_rank_mapping_keeps_unique_gpu_visibility():
         model_device(0, 4, 1, 2)
     with pytest.raises(ValueError):
         model_device(0, 3, 2, 2)
+
+
+@pytest.mark.parametrize('rank,local_rank,visible,replicas', [
+    (14, 14, '0,1,2,3,4,5,6,7', 3),
+    (23, 23, '0,1,2,3,4,5,6,7', 3),
+    (38, 14, '0,1,2,3,4,5,6,7', 3),
+    (3, 3, '3,5', 2),
+    (3, 3, 'GPU-first,GPU-second', 2),
+    (1, 1, '3,5', 1),
+])
+def test_entrypoint_initializes_mmengine_logger_for_shared_gpu(
+        tmp_path, monkeypatch, rank, local_rank, visible, replicas):
+    """Exercise MMEngine's actual CUDA logging path without CUDA hardware."""
+    import torch
+    from mmengine import Config
+    from mmengine.logging import MMLogger
+    from mmengine.logging.logger import _get_device_id
+
+    from fluxvla.engines.runners.serving import distributed_server as module
+
+    tokens = visible.split(',')
+    local_world_size = len(tokens) * replicas
+    world_size = local_world_size * (rank // local_world_size + 1)
+    for name, value in dict(
+            RANK=rank,
+            LOCAL_RANK=local_rank,
+            WORLD_SIZE=world_size,
+            LOCAL_WORLD_SIZE=local_world_size,
+            CUDA_VISIBLE_DEVICES=visible).items():
+        monkeypatch.setenv(name, str(value))
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(torch.cuda, 'device_count', lambda: len(tokens))
+    device_index = local_rank % len(tokens)
+    physical_device = tokens[device_index]
+    expected_device = (
+        int(physical_device)
+        if physical_device.isdecimal() else physical_device)
+    load_config = Config.fromfile
+    logger_devices = []
+
+    def checked_config(*args, **kwargs):
+        # Custom config imports may initialize MMLogger before model loading.
+        logger = MMLogger(f'config-rank-{rank}')
+        logger.info('shared-GPU config initialization')
+        logger_devices.append(_get_device_id())
+        return load_config(*args, **kwargs)
+
+    def launch(**kwargs):
+        logger = MMLogger(f'model-rank-{rank}')
+        logger.info('shared-GPU model initialization')
+        logger_devices.append(_get_device_id())
+        assert kwargs['rank'] == rank
+        assert kwargs['world_size'] == world_size
+        assert kwargs['device'] == f'cuda:{device_index}'
+        assert os.environ['RANK'] == str(rank)
+        assert os.environ['WORLD_SIZE'] == str(world_size)
+        assert os.environ['LOCAL_WORLD_SIZE'] == str(local_world_size)
+        assert os.environ['CUDA_VISIBLE_DEVICES'] == visible
+
+    monkeypatch.setattr(Config, 'fromfile', checked_config)
+    monkeypatch.setattr(module, 'launch_server_task', launch)
+    config = tmp_path / 'model.py'
+    config.write_text('themis = dict(server=dict())\neval = dict()\n')
+    checkpoint = tmp_path / 'model.safetensors'
+    checkpoint.touch()
+    assert entrypoint['main']([
+        '--config',
+        str(config), '--ckpt-path',
+        str(checkpoint), '--workers-per-gpu',
+        str(replicas)
+    ]) == 0
+    assert logger_devices == [expected_device, expected_device]
 
 
 def test_loads_parallel_devices_serial_replicas_and_preserves_rank(
