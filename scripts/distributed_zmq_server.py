@@ -35,6 +35,7 @@ def parse_args(argv=None):
         description='Launch the stateless FluxVLA ZMQ inference service.')
     parser.add_argument('--config', required=True)
     parser.add_argument('--ckpt-path', default=None)
+    parser.add_argument('--workers-per-gpu', type=int, default=1)
     networking = parser.add_argument_group('advanced networking')
     networking.add_argument(
         '--frontend-bind',
@@ -72,6 +73,18 @@ def _connect_endpoint(bind: str, host: str) -> str:
     return 'tcp://{}:{}'.format(host, parsed.port)
 
 
+def model_device(local_rank: int, local_world_size: int, workers_per_gpu: int,
+                 visible_count: int) -> str:
+    if workers_per_gpu < 1 or local_world_size % workers_per_gpu:
+        raise ValueError(
+            'Local worker count must be divisible by workers-per-gpu')
+    gpu_count = local_world_size // workers_per_gpu
+    if (not 0 <= local_rank < local_world_size
+            or not 1 <= gpu_count <= visible_count):
+        raise ValueError('Requested model workers exceed visible GPUs')
+    return f'cuda:{local_rank % gpu_count}'
+
+
 def main(argv=None) -> int:
     from mmengine import Config
 
@@ -83,6 +96,10 @@ def main(argv=None) -> int:
 
     args = parse_args(argv)
     rank, world_size, local_rank, master_addr = _torchrun_environment()
+    import torch
+    device = model_device(local_rank,
+                          int(os.environ.get('LOCAL_WORLD_SIZE', '1')),
+                          args.workers_per_gpu, torch.cuda.device_count())
     config_path = str(Path(args.config).expanduser().resolve(strict=True))
     cfg = Config.fromfile(config_path)
     if args.cfg_options:
@@ -96,8 +113,7 @@ def main(argv=None) -> int:
         args.ckpt_path or server_cfg.get('ckpt_path')
         or section_cfg.get('ckpt_path'))
     print(
-        '[FluxVLA] rank={} starting model worker on cuda:{}'.format(
-            rank, local_rank),
+        '[FluxVLA] rank={} starting model worker on {}'.format(rank, device),
         flush=True)
     frontend_bind = args.frontend_bind
     backend_bind = args.backend_bind
@@ -107,7 +123,7 @@ def main(argv=None) -> int:
     launch_server_task(
         config_path=config_path,
         ckpt_path=str(checkpoint),
-        device='cuda:{}'.format(local_rank),
+        device=device,
         frontend_bind=frontend_bind,
         backend_bind=backend_bind,
         backend_endpoint=backend_endpoint,

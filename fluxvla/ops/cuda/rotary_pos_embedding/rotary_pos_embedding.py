@@ -14,14 +14,14 @@
 import torch
 from torch.autograd import Function
 
-from . import rotary_pos_embedding_ext
-
 
 class RotaryPosEmbedding(Function):
 
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor,
                 sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        from . import rotary_pos_embedding_ext
+
         # Ensure position_ids is int32 type as expected by CUDA kernel
         assert q.is_contiguous()
         assert k.is_contiguous()

@@ -103,6 +103,29 @@ def test_invalid_fp32_layers_rejected(indices):
         ConditionGemmaModel(num_hidden_layers=2, fp32_layers=indices)
 
 
+def test_action_expert_without_token_embedding_accepts_official_layout():
+    model = ConditionGemmaModel(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        adarms_cond_dim=12,
+        use_token_embedding=False).eval()
+    assert 'embed_tokens.weight' not in model.state_dict()
+    with torch.no_grad():
+        output = model(
+            inputs_embeds=torch.zeros(1, 3, 16),
+            adarms_cond=torch.zeros(1, 12),
+            attention_mask=torch.zeros(1, 1, 3, 3),
+            position_ids=torch.arange(3)[None],
+            use_cache=False)
+    assert output.last_hidden_state.shape == (1, 3, 16)
+    assert torch.isfinite(output.last_hidden_state).all()
+
+
 @pytest.mark.parametrize('amp', [False, True])
 def test_protected_attention_cache_matches_joint_block_mask(amp):
     torch.manual_seed(54)

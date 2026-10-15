@@ -15,14 +15,14 @@
 import torch
 from torch.autograd import Function
 
-from . import gemma_rotary_embedding_ext
-
 
 class GemmaRotaryEmbedding(Function):
 
     @staticmethod
     def forward(ctx, position_ids: torch.Tensor, inv_freq: torch.Tensor,
                 attention_scaling: float) -> tuple[torch.Tensor, torch.Tensor]:
+        from . import gemma_rotary_embedding_ext
+
         # Ensure position_ids is int32 type as expected by CUDA kernel
         position_ids = position_ids.to(dtype=torch.int32).contiguous()
         assert inv_freq.is_contiguous()

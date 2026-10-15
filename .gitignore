@@ -22,7 +22,9 @@
 
 # Ignore checkpoint files
 *.ckpt
+*.pt
 *.pth
+*.safetensors
 *.h5
 *.model
 *.weights
@@ -39,8 +41,24 @@
 *.bak
 *.swp
 *.DS_Store
-*.pyc
+*.py[cod]
 Thumbs.db
+
+# Ignore Python caches and local virtual environments
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.venv/
+venv/
+/.cache/
+
+# Ignore test coverage reports
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
 # Ignore node_modules and dependencies
 node_modules/

@@ -34,6 +34,7 @@ class FluxVLAServingRunner:
                  model_outputs_environment_actions: bool = False,
                  denormalize_context: Mapping[str, Any] | None = None,
                  denormalize_per_action: bool = False,
+                 sequence_noise: bool = False,
                  expected_unnorm_key: str = '') -> None:
         if not callable(dataset):
             raise TypeError('FluxVLA server dataset must be callable')
@@ -75,6 +76,9 @@ class FluxVLAServingRunner:
         self.denormalize_context = dict(denormalize_context or {})
         self.denormalize_per_action = denormalize_per_action
         self.expected_unnorm_key = expected_unnorm_key
+        if not isinstance(sequence_noise, bool):
+            raise TypeError('sequence_noise must be a bool')
+        self.sequence_noise = sequence_noise
         if self.device.type == 'cuda':
             torch.cuda.set_device(self.device)
         self.vla.eval()
@@ -83,8 +87,11 @@ class FluxVLAServingRunner:
         else:
             self.vla.to(self.device)
 
-    def predict_action(self, observation: Mapping[str, Any], unnorm_key: str,
-                       policy_seed: int) -> tuple[np.ndarray, float]:
+    def predict_action(self,
+                       observation: Mapping[str, Any],
+                       unnorm_key: str,
+                       policy_seed: int,
+                       sequence: int = 1) -> tuple[np.ndarray, float]:
         """Process one self-contained request and return ``[T, A]`` actions."""
         if not isinstance(observation, Mapping):
             raise TypeError('observation must be a mapping')
@@ -107,6 +114,18 @@ class FluxVLAServingRunner:
             batch['unnorm_key'] = unnorm_key
         batch['seed'] = int(policy_seed)
         batch = self._move_to_device(batch)
+        if self.sequence_noise:
+            if isinstance(
+                    sequence,
+                    bool) or not isinstance(sequence, int) or sequence < 1:
+                raise ValueError('sequence must be a positive integer')
+            # Replay only PI05's small noise draws, not inference or history.
+            # This reproduces the original episode RNG stream even if a
+            # request is retried or routed to another stateless worker.
+            shape = (batch['states'].shape[0], self.vla.n_action_steps,
+                     self.vla.max_action_dim)
+            for _ in range(sequence):
+                batch['noise'] = self.vla.sample_noise(shape, self.device)
 
         if self.device.type == 'cuda':
             torch.cuda.synchronize(self.device)
@@ -256,6 +275,11 @@ def build_serving_runner_from_config(
         require_mapping(
             themis_cfg.get('transport', _MISSING), 'themis.transport'))
     server_cfg = get_server_config(themis_cfg)
+    resolved_device = device or server_cfg.get('device', 'cuda:0')
+    if torch.device(resolved_device).type == 'cuda':
+        # Constructors and CUDA libraries must use this rank's device before
+        # any checkpoint or model allocation takes place.
+        torch.cuda.set_device(resolved_device)
 
     section_name = server_cfg.get('dataset_section', 'eval')
     if section_name not in {'eval', 'inference'}:
@@ -325,7 +349,6 @@ def build_serving_runner_from_config(
                                     section_cfg, transport)
         validate_denormalization_stats(denormalize_action, denormalize_context)
 
-    resolved_device = device or server_cfg.get('device', 'cuda:0')
     dtype_name = server_cfg.get('mixed_precision_dtype', 'bf16')
     from fluxvla.engines import build_runner_from_cfg
 

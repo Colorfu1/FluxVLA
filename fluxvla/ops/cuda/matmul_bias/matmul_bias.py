@@ -13,8 +13,6 @@
 # limitations under the License.
 import torch
 
-from . import matmul_bias_ext
-
 
 def matmul_bias_cuda(inp: torch.Tensor,
                      weight: torch.Tensor,
@@ -33,6 +31,8 @@ def matmul_bias_cuda(inp: torch.Tensor,
         out: optional pre-allocated (M, N) bf16 tensor (for CUDA Graph).
         res: optional residual (M, N) bf16 tensor added via beta=1.
     """
+    from . import matmul_bias_ext
+
     orig_shape = inp.shape
     if inp.dim() == 3:
         inp = inp.reshape(-1, orig_shape[-1])

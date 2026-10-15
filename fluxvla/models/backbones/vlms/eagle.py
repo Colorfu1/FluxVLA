@@ -25,8 +25,6 @@ from transformers.models.qwen3.modeling_qwen3 import (Qwen3Attention,
 from fluxvla.engines import VLM_BACKBONES, str_to_dtype
 from fluxvla.engines.utils.fsdp_wrapping import \
     build_transformer_layer_wrap_policy
-from fluxvla.models.third_party_models.eagle2_hg_model.modeling_eagle2_5_vl import \
-    Eagle2_5_VLForConditionalGeneration  # noqa: E501
 from .hf_vlm import apply_attn_implementation_to_config
 
 
@@ -57,6 +55,9 @@ class EagleBackbone(nn.Module):
                  tune_llm: Optional[bool] = None,
                  tune_visual: Optional[bool] = None):
         super().__init__()
+        # Eagle's FlashAttention dependency is only needed by Eagle models.
+        from fluxvla.models.third_party_models.eagle2_hg_model.modeling_eagle2_5_vl import \
+            Eagle2_5_VLForConditionalGeneration  # noqa: E501
 
         config = AutoConfig.from_pretrained(vlm_path, trust_remote_code=True)
         # Reduce the number of layers in config BEFORE model creation

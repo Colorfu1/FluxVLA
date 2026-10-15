@@ -93,6 +93,8 @@ setup(
             sources_cuda=['src/matmul_bias_forward_cuda.cu'],
             extra_libraries=['cublasLt'],
         ),
-    ],
+    ] if os.getenv('FLUXVLA_BUILD_EXTENSIONS', '1') != '0' else [],
+    # Standard PyTorch inference does not need the optional custom CUDA ops.
+    # This permits an editable inference install without a local CUDA toolkit.
     cmdclass={'build_ext': BuildExtension},
 )

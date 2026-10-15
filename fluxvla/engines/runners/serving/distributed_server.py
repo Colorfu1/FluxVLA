@@ -37,6 +37,8 @@ class _PendingPrediction:
     unnorm_key: str
     payload: bytes
     deadline: float
+    model_worker_id: str | None = None
+    sequence: int = 1
 
 
 @dataclass
@@ -47,6 +49,7 @@ class _ModelWorker:
     device: str
     is_ready: bool = False
     prediction: _PendingPrediction | None = None
+    loading_started_at: float | None = None
 
     @property
     def is_idle(self) -> bool:
@@ -64,6 +67,8 @@ class FluxVLAInferenceServer:
                  max_pending_requests: int = 128,
                  request_timeout_s: float = 120.0,
                  startup_timeout_s: float = 900.0,
+                 startup_parallelism: int | None = None,
+                 strict_worker_assignment: bool = False,
                  deployment_id: str | None = None) -> None:
         self.frontend_bind = _endpoint(frontend_bind, 'frontend_bind')
         self.backend_bind = _endpoint(backend_bind, 'backend_bind')
@@ -77,6 +82,20 @@ class FluxVLAInferenceServer:
         self.startup_timeout_s = _positive_float(startup_timeout_s,
                                                  'startup_timeout_s')
         self.deployment_id = deployment_id or uuid.uuid4().hex
+        self.startup_parallelism = (None if startup_parallelism is None else
+                                    _positive_int(startup_parallelism,
+                                                  'startup_parallelism'))
+        if not isinstance(strict_worker_assignment, bool):
+            raise TypeError('strict_worker_assignment must be a boolean')
+        self.strict_worker_assignment = strict_worker_assignment
+        self._startup_announced = False
+        self._observation_video = None
+        video_cfg = config_get(
+            getattr(evaluation_report_writer, 'eval_config', {}),
+            'observation_video', None)
+        if video_cfg:
+            from .observation_video import ObservationVideoRecorder
+            self._observation_video = ObservationVideoRecorder(**video_cfg)
 
         self._workers: dict[bytes, _ModelWorker] = {}
         self._worker_ids: set[str] = set()
@@ -127,18 +146,28 @@ class FluxVLAInferenceServer:
                     self._receive_frontend()
                 if self._backend in events:
                     self._receive_backend()
+                self._schedule_loads()
                 self._expire_predictions()
                 self._dispatch_predictions()
-                if (self.status == 'starting'
+                if (len(self._workers) < self.expected_workers
                         and time.monotonic() >= startup_deadline):
                     raise TimeoutError(
                         f'only {self.ready_workers}/'
                         f'{self.expected_workers} model workers became '
                         'ready')
+                for worker in self._workers.values():
+                    if (not worker.is_ready
+                            and worker.loading_started_at is not None
+                            and time.monotonic() - worker.loading_started_at >=
+                            self.startup_timeout_s):
+                        raise TimeoutError(
+                            f'model loading timed out on {worker.worker_id}')
                 if self._shutdown_started and not self._predictions_by_id:
                     break
         finally:
             self._begin_shutdown()
+            if self._observation_video is not None:
+                self._observation_video.close()
             for current in (self._frontend, self._backend):
                 if current is not None:
                     current.close(linger=1000)
@@ -212,6 +241,19 @@ class FluxVLAInferenceServer:
         unnorm_key = header.get('unnorm_key', '')
         if not isinstance(unnorm_key, str):
             raise TypeError('header.unnorm_key must be a string')
+        model_worker_id = None
+        if self.strict_worker_assignment:
+            episode_id = _required_string(header, 'episode_id')
+            session, separator, ordinal = episode_id.rpartition(':')
+            if not session or not separator or not ordinal.isdecimal() or int(
+                    ordinal) < 1:
+                raise ValueError(
+                    'episode_id must be <session>:<positive ordinal>')
+            index = (int(ordinal) - 1) % self.expected_workers
+            model_worker_id = f'model-worker-{index}'
+        if self._observation_video is not None:
+            self._observation_video.record(
+                decode_frame(payload), _required_string(header, 'episode_id'))
         pending = _PendingPrediction(
             route=route,
             request_id=request_id,
@@ -219,6 +261,10 @@ class FluxVLAInferenceServer:
             unnorm_key=unnorm_key,
             payload=payload,
             deadline=time.monotonic() + timeout_s,
+            model_worker_id=model_worker_id,
+            sequence=_required_int({'sequence': header.get('sequence', 1)},
+                                   'sequence',
+                                   minimum=1),
         )
         self._pending_predictions.append(pending)
         self._predictions_by_id[request_id] = pending
@@ -230,6 +276,13 @@ class FluxVLAInferenceServer:
         body = decode_frame(payload)
         if not isinstance(body, Mapping):
             raise TypeError('report_event payload must be a mapping')
+        if header.get(
+                'event_type') == 'run_start' and self.strict_worker_assignment:
+            if (body.get('parallel_workers') != self.expected_workers
+                    or body.get('strict_worker_assignment') is not True):
+                raise ValueError(
+                    'Strict assignment requires matching model and '
+                    'simulator worker counts and sharding')
         result = self.evaluation_report_writer.process_event(
             event_type=_required_string(header, 'event_type'),
             request_id=_required_string(header, 'request_id'),
@@ -240,6 +293,13 @@ class FluxVLAInferenceServer:
         if not isinstance(result, Mapping):
             raise TypeError(
                 'evaluation report writer response must be a mapping')
+        if bool(result.get('accepted',
+                           False)) and self._observation_video is not None:
+            self._observation_video.on_event(
+                dict(
+                    request_id=header['request_id'],
+                    event_type=header['event_type'],
+                    payload=dict(body)), result)
         self._send_frontend(
             route,
             encode_header(
@@ -274,6 +334,9 @@ class FluxVLAInferenceServer:
     def _register_worker(self, identity: bytes, header: Mapping[str,
                                                                 Any]) -> None:
         worker_id = _required_string(header, 'worker_id')
+        valid_ids = {f'model-worker-{i}' for i in range(self.expected_workers)}
+        if worker_id not in valid_ids:
+            raise ValueError(f'Unexpected model worker id {worker_id!r}')
         if identity in self._workers or worker_id in self._worker_ids:
             raise RuntimeError(f'duplicate model worker {worker_id!r}')
         if len(self._workers) >= self.expected_workers:
@@ -287,12 +350,53 @@ class FluxVLAInferenceServer:
         self._workers[identity] = worker
         self._worker_ids.add(worker_id)
 
+    def _schedule_loads(self) -> None:
+        """Load across GPUs in parallel, serializing replicas on each GPU."""
+        if self._shutdown_started or len(
+                self._workers) != self.expected_workers:
+            return
+        workers = sorted(
+            self._workers.values(),
+            key=lambda worker: int(worker.worker_id.rsplit('-', 1)[1]))
+        devices = {(worker.node_id, worker.device) for worker in workers}
+        limit = min(self.startup_parallelism or len(devices), len(devices))
+        if not self._startup_announced:
+            print(
+                '[FluxVLA] Inference startup '
+                'policy=parallel_devices_serial_replicas '
+                f'max_parallel={limit} devices={len(devices)} '
+                f'replicas={len(workers)}.',
+                flush=True)
+            self._startup_announced = True
+        loading = {
+            (worker.node_id, worker.device)
+            for worker in workers
+            if not worker.is_ready and worker.loading_started_at is not None
+        }
+        for worker in workers:
+            if len(loading) >= limit:
+                break
+            device = (worker.node_id, worker.device)
+            if (worker.is_ready or worker.loading_started_at is not None
+                    or device in loading):
+                continue
+            worker.loading_started_at = time.monotonic()
+            loading.add(device)
+            self._send_worker('load_worker', worker)
+
     def _mark_worker_ready(self, worker: _ModelWorker) -> None:
         if worker.is_ready:
             raise RuntimeError(
                 f'model worker {worker.worker_id!r} is already ready')
         worker.is_ready = True
         self._idle_workers.append(worker.identity)
+        index = int(worker.worker_id.rsplit('-', 1)[1])
+        elapsed = time.monotonic() - (
+            worker.loading_started_at or time.monotonic())
+        print(
+            f'[FluxVLA] Inference replica {index + 1}/{self.expected_workers} '
+            f'ready on {worker.device}; load_s={elapsed:.2f}.',
+            flush=True)
         print(
             f'[FluxVLA] model worker ready id={worker.worker_id} '
             f'node={worker.node_id} device={worker.device}',
@@ -329,11 +433,10 @@ class FluxVLAInferenceServer:
                             payload)
 
     def _dispatch_predictions(self) -> None:
-        while self._pending_predictions:
-            pending = self._pending_predictions[0]
+        for pending in tuple(self._pending_predictions):
             request_id = pending.request_id
             if pending.deadline <= time.monotonic():
-                self._pending_predictions.popleft()
+                self._pending_predictions.remove(pending)
                 self._predictions_by_id.pop(request_id, None)
                 self._send_frontend_error(
                     pending.route,
@@ -341,16 +444,25 @@ class FluxVLAInferenceServer:
                     TimeoutError('prediction expired while queued'),
                     error_type='timeout')
                 continue
-            worker = self._next_idle_worker()
+            if pending.model_worker_id is not None:
+                worker = next((item for item in self._workers.values()
+                               if item.worker_id == pending.model_worker_id
+                               and item.is_idle), None)
+                if worker is None:
+                    continue
+                self._idle_workers.remove(worker.identity)
+            else:
+                worker = self._next_idle_worker()
             if worker is None:
                 return
-            self._pending_predictions.popleft()
+            self._pending_predictions.remove(pending)
             worker.prediction = pending
             self._send_worker(
                 'predict',
                 worker,
                 request_id=request_id,
                 policy_seed=pending.policy_seed,
+                sequence=pending.sequence,
                 unnorm_key=pending.unnorm_key,
                 payload=pending.payload,
             )
@@ -502,6 +614,14 @@ def run_model_worker(config_path: str,
         ),
         empty_payload(),
     ])
+    command = decode_header(backend.recv_multipart()[0])
+    if (command.get('deployment_id') != deployment_id
+            or command.get('worker_id') != worker_id):
+        raise RuntimeError('Invalid model loading assignment')
+    if command['type'] == 'shutdown_worker':
+        return
+    if command['type'] != 'load_worker':
+        raise RuntimeError('Expected model loading assignment')
     cfg = Config.fromfile(config_path)
     if cfg_options:
         cfg.merge_from_dict(dict(cfg_options))
@@ -537,6 +657,7 @@ def run_model_worker(config_path: str,
                 observation,
                 unnorm_key=str(header.get('unnorm_key', '')),
                 policy_seed=_required_int(header, 'policy_seed'),
+                sequence=_required_int(header, 'sequence', minimum=1),
             )
             actions = np.asarray(actions, dtype=np.float32)
             backend.send_multipart([
@@ -620,7 +741,7 @@ def build_evaluation_report_writer_from_config(
         config_path=resolved_config_path,
         ckpt_path=resolved_ckpt,
         eval_config=report_eval_config,
-        logger=None,
+        logger=lambda message: print(message, flush=True),
         feishu=reporting_cfg.get('feishu'),
         report_kind=reporting_cfg.get('report_kind'),
     )
@@ -646,7 +767,7 @@ def launch_server_task(*,
         raise TypeError('rank must be an integer')
     if rank < 0 or rank >= world_size:
         raise ValueError('rank must be in [0, world_size)')
-    node_id = f'{network_socket.gethostname()}-rank-{rank}'
+    node_id = network_socket.gethostname()
     if deployment_id is None:
         deployment_id = (
             os.environ.get('FLUXVLA_DEPLOYMENT_ID')
@@ -754,6 +875,10 @@ def _server_process_main(*, config_path: str, ckpt_path: str,
         max_pending_requests=max_pending_requests,
         request_timeout_s=request_timeout_s,
         startup_timeout_s=startup_timeout_s,
+        startup_parallelism=get_server_config(
+            cfg.themis).get('startup_parallelism'),
+        strict_worker_assignment=get_server_config(cfg.themis).get(
+            'strict_worker_assignment', False),
         deployment_id=deployment_id,
     )
     server.run()

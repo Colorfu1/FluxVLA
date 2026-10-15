@@ -835,6 +835,8 @@ class ConditionGemmaModel(GemmaPreTrainedModel):
         fp32_layers (`Sequence[int]`, *optional*):
             Layers whose attention projections and FFNs compute in FP32.
             Requires FP32 parameters; other layers retain autocast behavior.
+        use_token_embedding (`bool`, *optional*, defaults to `True`):
+            Disable for OpenPI action experts that receive only embeddings.
     """
 
     def __init__(self,
@@ -864,7 +866,8 @@ class ConditionGemmaModel(GemmaPreTrainedModel):
                  vocab_size: int = 257152,
                  adarms_fp32: bool = False,
                  attention_math_fp32: bool = False,
-                 fp32_layers: Optional[Sequence[int]] = None):
+                 fp32_layers: Optional[Sequence[int]] = None,
+                 use_token_embedding: bool = True):
         # These switches affect computation, not checkpoint parameter layout.
         # Protected layers require FP32 master parameters under autocast.
         fp32_layers = tuple(fp32_layers or ())
@@ -904,8 +907,9 @@ class ConditionGemmaModel(GemmaPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size,
-                                         self.padding_idx)
+        self.embed_tokens = (
+            nn.Embedding(config.vocab_size, config.hidden_size,
+                         self.padding_idx) if use_token_embedding else None)
         self.layers = nn.ModuleList([
             GemmaDecoderLayer(config, layer_idx)
             for layer_idx in range(config.num_hidden_layers)
